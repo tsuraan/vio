@@ -46,7 +46,7 @@ fn main() {
 
   for i in 0..thcount {
     let conf = config.clone();
-    ts.push(thread::spawn(move || {frames(&conf, i, "/dev/urandom");}));
+    ts.push(thread::spawn(move || {frames(&conf, i);}));
   }
 
   loop {
@@ -158,7 +158,8 @@ fn workfile_name(config: &Config, threadno: i32) -> String {
   path
 }
 
-fn frames(config: &Config, threadno: i32, path: &str) {
+fn frames(config: &Config, threadno: i32) {
+  let path            = workfile_name(config, threadno);
   let mut file        = File::open(path).unwrap();
   let mut buf:Vec<u8> = repeat(0).take(config.buffersize).collect();
   let mut total       = 0;
