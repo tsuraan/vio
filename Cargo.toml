@@ -1,0 +1,10 @@
+[package]
+name = "vio"
+version = "0.1.0"
+authors = ["Jeremy Groven <jeremy.groven@gmail.com>"]
+
+[dependencies]
+time = "0.1"
+getopts = "0.2"
+mersenne_twister = "0.3"
+rand = "0.3"
