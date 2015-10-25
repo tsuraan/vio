@@ -176,15 +176,20 @@ fn play(config: &Config, threadno: i32) {
   loop {
     total += 1;
     if frame(&mut file, &mut buf, &frame_end, &mut fails) {
-      println!("{} frames, {} failures", total, fails);
+      report(total, fails);
       return;
     }
     if SteadyTime::now() > end_time {
-      println!("{} frames, {} failures", total, fails);
+      report(total, fails);
       return;
     }
     frame_end   = frame_end + frame_len;
   }
+}
+
+fn report(total: i32, fails: i32) {
+  let percent = 100.0 * (fails as f32) / (total as f32);
+  println!("{} frames, {} failures ({}%)", total, fails, percent);
 }
 
 /// Play a frame. This takes the time at which the frame needs to be completed.
