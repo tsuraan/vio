@@ -66,7 +66,6 @@ fn opts() -> Config {
   opts.optopt("d", "dir", "set working directory", "DIR");
   opts.optopt("r", "rate", "set code frame rate", "RATE");
   opts.optopt("s", "size", "set code frame size", "SIZE");
-  opts.optopt("b", "buffer", "set buffer size", "BUF");
   opts.optopt("l", "limit", "set time limit", "SECONDS");
   let matches = match opts.parse(&args[1..]) {
     Ok(m) => { m }
