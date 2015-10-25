@@ -8,15 +8,13 @@ use rand::{Rng, SeedableRng, random};
 use std::process::exit;
 use std::env;
 use std::thread;
-use std::ops::Sub;
 use std::fs::{OpenOptions, File, metadata};
 use std::str::FromStr;
 use std::string::String;
 use std::io::{Read, Write};
-use std::ops::Rem;
 use std::iter::repeat;
 use std::thread::sleep_ms;
-use time::{Duration, PreciseTime};
+use time::{Duration, SteadyTime};
 use getopts::Options;
 
 #[derive(Clone, Debug)]
@@ -24,7 +22,6 @@ struct Config {
   threads    :i32,
   framerate  :f32,
   framesize  :usize,
-  buffersize :usize,
   timelimit  :Duration,
   workdir    :String,
   hostname   :String,
@@ -46,7 +43,7 @@ fn main() {
 
   for i in 0..thcount {
     let conf = config.clone();
-    ts.push(thread::spawn(move || {frames(&conf, i);}));
+    ts.push(thread::spawn(move || {play(&conf, i);}));
   }
 
   loop {
@@ -57,6 +54,8 @@ fn main() {
   }
 }
 
+/// Parse argv options into a configuration object. This will panic if the
+/// given argv cannot be understood, and will give a configuration otherwise.
 fn opts() -> Config {
   let args: Vec<String> = env::args().collect();
   let program = args[0].clone();
@@ -100,10 +99,6 @@ fn opts() -> Config {
     None      => {1024*1024}
     Some(s) => {FromStr::from_str(&s).unwrap()} };
 
-  let buf = match matches.opt_str("b") {
-    None      => {64*1024}
-    Some(b) => {FromStr::from_str(&b).unwrap()} };
-
   let sec = match matches.opt_str("l") {
     None      => {8*60}
     Some(s) => {FromStr::from_str(&s).unwrap()} };
@@ -112,13 +107,16 @@ fn opts() -> Config {
     threads:    threads,
     framerate:  rate,
     framesize:  size,
-    buffersize: buf,
     timelimit:  Duration::seconds(sec),
     workdir:    dir,
     hostname:   host,
     }
 }
 
+/// Ensure that the working files are all present. Returns True if everything
+/// was already there, False if some files had to be written (or expanded).
+/// Main will exit if any files had to be written, which makes aligning
+/// multi-machine benchmarks much easier.
 fn verify_workfile(config: &Config, threadno: i32) -> bool {
   let name = workfile_name(&config, threadno);
   println!("Verifying existence of {}", name);
@@ -147,6 +145,7 @@ fn verify_workfile(config: &Config, threadno: i32) -> bool {
   true
 }
 
+/// Generate the name that this thread will use for its work file
 fn workfile_name(config: &Config, threadno: i32) -> String {
   let mut path = String::new();
   path.push_str(&config.workdir[..]);
@@ -158,106 +157,77 @@ fn workfile_name(config: &Config, threadno: i32) -> String {
   path
 }
 
-fn frames(config: &Config, threadno: i32) {
+/// Simulate playing a video. This will run through the work file at the
+/// configured framerate and frame size, logging every time that a frame could
+/// not be delivered on time. The final result of this function is a message
+/// that displays the total number of frames that were "played", and how many
+/// had to be dropped.
+fn play(config: &Config, threadno: i32) {
   let path            = workfile_name(config, threadno);
   let mut file        = File::open(path).unwrap();
-  let mut buf:Vec<u8> = repeat(0).take(config.buffersize).collect();
+  let mut buf:Vec<u8> = repeat(0).take(config.framesize).collect();
   let mut total       = 0;
   let mut fails       = 0;
-  let start           = PreciseTime::now();
+  let frame_len       = Duration::microseconds( (1e6 / config.framerate) as i64);
+  let start           = SteadyTime::now();
+  let end_time        = start + config.timelimit;
+  let mut frame_end   = start + frame_len;
 
   loop {
-    if one_second(config, &mut file, &mut buf, &mut total, &mut fails) {
+    total += 1;
+    if frame(&mut file, &mut buf, &frame_end, &mut fails) {
       println!("{} frames, {} failures", total, fails);
       return;
     }
-    if start.to(PreciseTime::now()) > config.timelimit {
+    if SteadyTime::now() > end_time {
       println!("{} frames, {} failures", total, fails);
       return;
     }
+    frame_end   = frame_end + frame_len;
   }
 }
 
-fn one_second(config:   &Config,
-              mut file: &mut File,
-              buf:      &mut[u8],
-              total:    &mut i32,
-              fails:    &mut i32
-             ) -> bool
-{
-  let mut frameno = 0;
-  let second_start = PreciseTime::now();
-  loop {
-    let sz  = frame_size(frameno, config.framerate, config.framesize);
-    let dur = frame_duration(frameno, config.framerate, second_start);
-    // println!("frameno is {}, sz is {}, dur is {}", frameno, sz, dur);
-    let eof = frame(&mut file, buf, sz, dur, fails);
-    *total += 1;
-    // println!("eof {}", eof);
-    if eof {
-      return true;
-    }
-    frameno = next_frameno(frameno, config.framerate);
-    if frameno == 0 {
-      return false;
-    }
-  }
-}
-
-fn frame_size(frameno: i32, rate: f32, perframe: usize) -> usize {
-  let diff = rate - (frameno as f32);
-  if diff >= 1.0 {
-    perframe
-  } else {
-    ((perframe as f32) * diff) as usize
-  }
-}
-
-fn frame_duration(frameno: i32, rate: f32, second_start: PreciseTime) -> Duration {
-  let ceil = rate.ceil() as i32;
-  if frameno+1 < ceil {
-    Duration::nanoseconds((1e9/rate) as i64)
-  } else {
-    // println!("final frame");
-    Duration::seconds(1).sub(second_start.to(PreciseTime::now()))
-  }
-}
-
-fn frame(fd:      &mut File,
-         buf:     &mut [u8],
-         szlimit: usize,
-         tmlimit: Duration,
-         fails:   &mut i32
+/// Play a frame. This takes the time at which the frame needs to be completed.
+/// If the function is called after that time (because a previous frame was
+/// seriously delayed) it will fail immediately and log the failure. If this
+/// frame takes too long, the failure will be logged. If the frame gets loaded
+/// before the cutoff time, this function will sleep until the frame is done
+/// being shown.
+///
+/// This returns True if the file reaches EOF, false if there's more to be read.
+fn frame(fd:        &mut File,
+         buf:       &mut [u8],
+         frame_end: &SteadyTime,
+         fails:     &mut i32
         ) -> bool {
-  let start = PreciseTime::now();
-  let mut total:usize = 0;
-  while total < szlimit {
-    let remain = szlimit - total;
-    let numread = read_at_most(fd, buf, remain);
-    if start.to(PreciseTime::now()) > tmlimit {
-      // println!("Out of time");
+  if SteadyTime::now() > *frame_end {
+    *fails += 1;
+    return false;
+  }
+
+  let mut toread = buf.len();
+  while toread > 0 {
+    let numread = read_at_most(fd, buf, toread);
+    if SteadyTime::now() > *frame_end {
       *fails += 1;
       return false;
     }
     if numread == 0 {
       return true;
     }
-    total += numread;
+    toread -= numread;
   }
-  let delay = tmlimit.sub(start.to(PreciseTime::now())).num_milliseconds();
-  // println!("Sleeping for {}ms", delay);
+
+  let delay = (*frame_end - SteadyTime::now()).num_milliseconds();
   if delay > 0 {
     sleep_ms(delay as u32);
   }
   false
 }
 
-fn next_frameno(current: i32, rate: f32) -> i32 {
-  let ceil = rate.ceil() as i32;
-  let nxt  = current + 1;
-  nxt.rem(ceil)
-}
-
+/// Helper function that doesn't read more data than desired. Normal Rust reads
+/// fill the buffer entirely; we don't always want that, if a previous read
+/// partially filled it due to whatever sort of problems that can happen.
 fn read_at_most(fd: &mut File, buf: &mut[u8], count: usize) -> usize {
   if count < buf.len() {
     fd.read(&mut buf[..count]).unwrap()
