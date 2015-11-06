@@ -3,19 +3,20 @@ extern crate time;
 extern crate getopts;
 extern crate mersenne_twister;
 
+use getopts::Options;
 use mersenne_twister::MersenneTwister;
 use rand::{Rng, SeedableRng, random};
-use std::process::exit;
 use std::env;
-use std::thread;
 use std::fs::{OpenOptions, File, metadata};
-use std::str::FromStr;
-use std::string::String;
 use std::io::{Read, Write};
 use std::iter::repeat;
+use std::process::exit;
+use std::str::FromStr;
+use std::string::String;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::thread;
 use std::thread::sleep_ms;
 use time::{Duration, SteadyTime};
-use getopts::Options;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -122,22 +123,22 @@ fn verify_workfile(config: &Config, threadno: i32) -> bool {
   let desired_sz = (config.framerate.ceil() as usize) *
                    config.framesize *
                    (config.timelimit.num_seconds() as usize + 1);
-  let mut to_write = match metadata(&name) {
-    Err(_)   => {desired_sz}
-    Ok(meta) => {desired_sz - meta.len() as usize} };
+  let mut sofar = match metadata(&name) {
+    Err(_)   => {0}
+    Ok(meta) => {meta.len() as usize} };
 
-  if to_write > 0 {
+  if sofar < desired_sz {
     let mut fd = OpenOptions::new()
       .write(true)
       .create(true)
       .append(true)
       .open(&name).unwrap();
-    let mut buf :[u8; 8192] = [0; 8192];
+    let mut buf:Vec<u8> = repeat(0).take(1024*1024).collect();
     let rand : u64 = random();
     let mut rng : MersenneTwister = SeedableRng::from_seed(rand);
-    while to_write > 0 {
+    while sofar < desired_sz {
       rng.fill_bytes(&mut buf);
-      to_write -= fd.write(&buf).unwrap();
+      sofar += fd.write(&buf).unwrap();
     }
     return false;
   }
@@ -156,6 +157,11 @@ fn workfile_name(config: &Config, threadno: i32) -> String {
   path
 }
 
+struct Buffered {
+  local: usize,
+  chan:  Receiver<usize>,
+}
+
 /// Simulate playing a video. This will run through the work file at the
 /// configured framerate and frame size, logging every time that a frame could
 /// not be delivered on time. The final result of this function is a message
@@ -163,18 +169,20 @@ fn workfile_name(config: &Config, threadno: i32) -> String {
 /// had to be dropped.
 fn play(config: &Config, threadno: i32) {
   let path            = workfile_name(config, threadno);
-  let mut file        = File::open(path).unwrap();
-  let mut buf:Vec<u8> = repeat(0).take(config.framesize).collect();
   let mut total       = 0;
   let mut fails       = 0;
   let frame_len       = Duration::microseconds( (1e6 / config.framerate) as i64);
   let start           = SteadyTime::now();
   let end_time        = start + config.timelimit;
   let mut frame_end   = start + frame_len;
+  let (tx, rx)        = sync_channel(8);
+  let mut buffered    = Buffered { local: 0, chan: rx };
+
+  thread::spawn(move || { read_file(tx, path) });
 
   loop {
     total += 1;
-    if frame(&mut file, &mut buf, &frame_end, &mut fails) {
+    if frame(&mut buffered, config.framesize, &frame_end, &mut fails) {
       report(total, fails);
       return;
     }
@@ -191,6 +199,37 @@ fn report(total: i32, fails: i32) {
   println!("{} frames, {} failures ({}%)", total, fails, percent);
 }
 
+/// Reads the entire file, writing to the channel the amount that it's read.
+/// The frame function will feed from the associated channel when it needs more
+/// data to "play".
+fn read_file(tx: SyncSender<usize>, path: String) {
+  let mut file         = File::open(path).unwrap();
+  let mut buf: Vec<u8> = repeat(0).take(4*1024*1024).collect();
+  loop {
+    let read = file.read(&mut buf).unwrap();
+    if read <= 0 {
+      return;
+    }
+    tx.send(read).unwrap();
+  }
+}
+
+/// Read the desired amount of data from the buffered file. Returns True if the
+/// file hit EOF, False if there's more to read.
+fn read_buffer(buffered: &mut Buffered, mut amount: usize) -> bool {
+  if buffered.local > amount {
+    buffered.local -= amount;
+    false
+  }
+  else {
+    amount -= buffered.local;
+    match buffered.chan.recv() {
+      Ok(more) => { buffered.local = more; read_buffer(buffered, amount) }
+      Err(_)   => { true }
+    }
+  }
+}
+
 /// Play a frame. This takes the time at which the frame needs to be completed.
 /// If the function is called after that time (because a previous frame was
 /// seriously delayed) it will fail immediately and log the failure. If this
@@ -199,8 +238,8 @@ fn report(total: i32, fails: i32) {
 /// being shown.
 ///
 /// This returns True if the file reaches EOF, false if there's more to be read.
-fn frame(fd:        &mut File,
-         buf:       &mut [u8],
+fn frame(buffered:  &mut Buffered,
+         frame_sz:  usize,
          frame_end: &SteadyTime,
          fails:     &mut i32
         ) -> bool {
@@ -209,34 +248,15 @@ fn frame(fd:        &mut File,
     return false;
   }
 
-  let mut toread = buf.len();
-  while toread > 0 {
-    let numread = read_at_most(fd, buf, toread);
-    if SteadyTime::now() > *frame_end {
-      *fails += 1;
-      return false;
-    }
-    if numread == 0 {
-      return true;
-    }
-    toread -= numread;
+  let eof = read_buffer(buffered, frame_sz);
+  if SteadyTime::now() > *frame_end {
+    *fails += 1;
+    return eof;
   }
-
   let delay = (*frame_end - SteadyTime::now()).num_milliseconds();
   if delay > 0 {
     sleep_ms(delay as u32);
   }
-  false
-}
-
-/// Helper function that doesn't read more data than desired. Normal Rust reads
-/// fill the buffer entirely; we don't always want that, if a previous read
-/// partially filled it due to whatever sort of problems that can happen.
-fn read_at_most(fd: &mut File, buf: &mut[u8], count: usize) -> usize {
-  if count < buf.len() {
-    fd.read(&mut buf[..count]).unwrap()
-  } else {
-    fd.read(buf).unwrap()
-  }
+  eof
 }
 
