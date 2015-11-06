@@ -210,7 +210,10 @@ fn read_file(tx: SyncSender<usize>, path: String) {
     if read <= 0 {
       return;
     }
-    tx.send(read).unwrap();
+    match tx.send(read) {
+      Ok(_)  => {()}
+      Err(_) => {return}
+    }
   }
 }
 
