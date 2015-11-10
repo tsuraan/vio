@@ -174,11 +174,11 @@ fn play(config: &Config, threadno: i32) {
   let frame_len       = Duration::microseconds( (1e6 / config.framerate) as i64);
   let start           = SteadyTime::now();
   let end_time        = start + config.timelimit;
-  let mut frame_end   = start + frame_len;
-  let (tx, rx)        = sync_channel(8);
+  let (tx, rx)        = sync_channel(256);
   let mut buffered    = Buffered { local: 0, chan: rx };
 
   thread::spawn(move || { read_file(tx, path) });
+  let mut frame_end   = start + frame_len;
 
   loop {
     total += 1;
@@ -190,7 +190,7 @@ fn play(config: &Config, threadno: i32) {
       report(total, fails);
       return;
     }
-    frame_end   = frame_end + frame_len;
+    frame_end = frame_end + frame_len;
   }
 }
 
@@ -204,7 +204,7 @@ fn report(total: i32, fails: i32) {
 /// data to "play".
 fn read_file(tx: SyncSender<usize>, path: String) {
   let mut file         = File::open(path).unwrap();
-  let mut buf: Vec<u8> = repeat(0).take(4*1024*1024).collect();
+  let mut buf: Vec<u8> = repeat(0).take(128*1024).collect();
   loop {
     let read = file.read(&mut buf).unwrap();
     if read <= 0 {
@@ -220,7 +220,7 @@ fn read_file(tx: SyncSender<usize>, path: String) {
 /// Read the desired amount of data from the buffered file. Returns True if the
 /// file hit EOF, False if there's more to read.
 fn read_buffer(buffered: &mut Buffered, mut amount: usize) -> bool {
-  if buffered.local > amount {
+  if buffered.local >= amount {
     buffered.local -= amount;
     false
   }
