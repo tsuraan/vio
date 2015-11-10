@@ -41,6 +41,7 @@ fn main() {
     println!("Created work files. quitting.");
     return;
   }
+  println!("Running benchmarks");
 
   for i in 0..thcount {
     let conf = config.clone();
@@ -185,7 +186,7 @@ fn play(config: &Config, threadno: i32) {
   let frame_len       = Duration::microseconds( (1e6 / config.framerate) as i64);
   let start           = SteadyTime::now();
   let end_time        = start + config.timelimit;
-  let (tx, rx)        = sync_channel(256);
+  let (tx, rx)        = sync_channel(512);
   let mut buffered    = Buffered { local: 0, chan: rx };
 
   thread::spawn(move || { read_file(tx, path) });
@@ -215,7 +216,7 @@ fn report(total: i32, fails: i32) {
 /// data to "play".
 fn read_file(tx: SyncSender<usize>, path: String) {
   let mut file         = File::open(path).unwrap();
-  let mut buf: Vec<u8> = repeat(0).take(128*1024).collect();
+  let mut buf: Vec<u8> = repeat(0).take(64*1024).collect();
   loop {
     let read = file.read(&mut buf).unwrap();
     if read <= 0 {
