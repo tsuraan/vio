@@ -65,8 +65,13 @@ fn opts() -> Config {
   opts.optopt("t", "threads", "set thread count", "NUM");
   opts.optopt("o", "host", "set hostname", "HOST");
   opts.optopt("d", "dir", "set working directory", "DIR");
-  opts.optopt("r", "rate", "set code frame rate", "RATE");
-  opts.optopt("s", "size", "set code frame size", "SIZE");
+  opts.optopt("r", "rate", "set codec frame rate (fps)", "RATE");
+  opts.optopt("s", "size",
+              "set codec frame size (bytes)   (overridden by bandwidth)",
+              "SIZE");
+  opts.optopt("b", "bandwidth",
+              "set codec bandwidth  (bytes/s) (overrides size)",
+              "BPS");
   opts.optopt("l", "limit", "set time limit", "SECONDS");
   let matches = match opts.parse(&args[1..]) {
     Ok(m) => { m }
@@ -95,9 +100,15 @@ fn opts() -> Config {
     None      => {24.0}
     Some(r) => {FromStr::from_str(&r).unwrap()} };
 
-  let size = match matches.opt_str("s") {
-    None      => {1024*1024}
-    Some(s) => {FromStr::from_str(&s).unwrap()} };
+  let bw   = match matches.opt_str("b") {
+    None    => {match matches.opt_str("s") {
+                  Some(s) => {let sz:f32 = FromStr::from_str(&s).unwrap();
+                              sz * rate}
+                  None    => {1024.0*1024.0*rate}} }
+    Some(s) => {FromStr::from_str(&s).unwrap()}
+    };
+
+  let size = (bw / rate) as usize;
 
   let sec = match matches.opt_str("l") {
     None      => {8*60}
